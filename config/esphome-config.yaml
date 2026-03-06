@@ -8,8 +8,9 @@
 # Setup:
 # The onboard 24V DC needs to be converted to 5V DC (with a MP1584EN) to power a ESP-32.
 # It controls a GP8403 via I2C, which outputs any voltage between 0V and 10V.
+# (An input signal between 0...1 results in the output range of 0V...10V.)
 # The ESP-32 also controls a relay module, which in turn controls the 230V
-# deliverd to the "100331.14" actuator, which keeps the ventilation flap/cover open
+# delivered to the "100331.14" actuator, which keeps the ventilation flap/cover open
 # during operation.
 
 # The states of the fan and cover are synchronized in the automations below, such
@@ -34,9 +35,9 @@ esphome:
         - output.set_level:
             id: my_gp8403_output_1
             level: 0
+        - fan.turn_off: my_fan
         - lambda: |-
             id(fan_voltage).publish_state(0);
-        - fan.turn_off: my_fan
         - component.update: fan_direction
 
 esp32:
@@ -96,26 +97,6 @@ sensor:
     entity_category: "diagnostic"
     filters:
       - multiply: 10
-    on_raw_value:
-      - if:
-          condition:
-            sensor.in_range:
-              id: fan_voltage
-              above: 0.001
-          then:
-            - lambda: id(my_gp8403_output_1).set_level(x);
-            - if:
-                condition:
-                  switch.is_off: cover_relay
-                then:
-                  - switch.turn_on: cover_relay
-          else:
-            - lambda: id(my_gp8403_output_1).set_level(0);
-            - if:
-                condition:
-                  switch.is_on: cover_relay
-                then:
-                  - switch.turn_off: cover_relay
 
 text_sensor:
   - platform: template
@@ -134,50 +115,52 @@ text_sensor:
         }
 
 script:
-  - id: set_fan_speed
+  - id: apply_fan_output
     then:
       - lambda: |-
-          // Within lambda, get the fan direction and conditionally do something
-          if (id(my_fan).direction == FanDirection::FORWARD) {
+          // The variable v takes values between 0...1 and
+          // results in voltages of 0V...10V by the GP8403 module.
+          float v = 0.0;
+
+          if (!id(my_fan).state || id(my_fan).speed == 0) {
+            v = 0.0;
+          } else if (id(my_fan).direction == FanDirection::FORWARD) {
             // Fan direction is forward (outward)
-            if (id(my_fan).speed == 3) {
-              id(fan_voltage).publish_state(0.312);
-            } else if (id(my_fan).speed == 2) {
-              id(fan_voltage).publish_state(0.358);
-            } else if (id(my_fan).speed == 1) {
-              id(fan_voltage).publish_state(0.433);
-            } else {
-              id(fan_voltage).publish_state(0);
-            }
+            if (id(my_fan).speed == 3) v = 0.312;
+            else if (id(my_fan).speed == 2) v = 0.358;
+            else if (id(my_fan).speed == 1) v = 0.433;
           } else {
             // Fan direction is reverse (inward)
-            if (id(my_fan).speed == 3) {
-              id(fan_voltage).publish_state(0.728);
-            } else if (id(my_fan).speed == 2) {
-              id(fan_voltage).publish_state(0.648);
-            } else if (id(my_fan).speed == 1) {
-              id(fan_voltage).publish_state(0.585);
-            } else {
-              id(fan_voltage).publish_state(0);
-            }
+            if (id(my_fan).speed == 3) v = 0.728;
+            else if (id(my_fan).speed == 2) v = 0.648;
+            else if (id(my_fan).speed == 1) v = 0.585;
+          }
+
+          id(my_gp8403_output_1).set_level(v);
+          id(fan_voltage).publish_state(v);
+
+          if (v > 0.001) {
+            if (!id(cover_relay).state) id(cover_relay).turn_on();
+          } else {
+            if (id(cover_relay).state) id(cover_relay).turn_off();
           }
   - id: run_fan_oscillation
     mode: restart
     then:
       - while:
           condition:
-            lambda: return id(my_fan).oscillating;
+            lambda: return id(my_fan).state && id(my_fan).oscillating;
           then:
             - delay: 70s
-            - script.execute: toggle_fan_direction
-  - id: toggle_fan_direction
-    then:
-      - lambda: |-
-          if (id(my_fan).direction == FanDirection::FORWARD) {
-            id(my_fan).make_call().set_direction(FanDirection::REVERSE).perform();
-          } else {
-            id(my_fan).make_call().set_direction(FanDirection::FORWARD).perform();
-          }
+            - lambda: |-
+                if (!id(my_fan).state) return;
+                auto call = id(my_fan).make_call();
+                call.set_direction(
+                  id(my_fan).direction == FanDirection::FORWARD
+                    ? FanDirection::REVERSE
+                    : FanDirection::FORWARD
+                );
+                call.perform();
 
 fan:
   - platform: template
@@ -189,35 +172,27 @@ fan:
     restore_mode: ALWAYS_OFF
     on_state:
       then:
-        - lambda: |-
-            if (id(my_fan).state) {
-              // Fan is ON: Restore the previous state
-              id(my_gp8403_output_1).set_level(id(fan_voltage).raw_state);
-              if (!id(cover_relay).state) {
-                id(cover_relay).turn_on();
-                }
-              //id(fan_voltage).publish_state(id(fan_voltage).raw_state);
-              if (id(my_fan).oscillating) {
-                // Fan is oscillating
-                if (!id(run_fan_oscillation).is_running()) {
-                  id(run_fan_oscillation).execute();
-                  }
-                }
-            } else {
-              // Fan is OFF
-              id(my_gp8403_output_1).set_level(0);
-              if (id(cover_relay).state) {
-                id(cover_relay).turn_off();
-                }
-              id(run_fan_oscillation).stop();
-            }
+        - script.execute: apply_fan_output
+        - if:
+            condition:
+              lambda: return id(my_fan).state;
+            then:
+              - if:
+                  condition:
+                    lambda: return id(my_fan).oscillating;
+                  then:
+                    - script.execute: run_fan_oscillation
+            else:
+              - script.stop: run_fan_oscillation
     on_speed_set:
       then:
-        - script.execute: set_fan_speed
+        - script.execute: apply_fan_output
     on_direction_set:
       then:
         - component.update: fan_direction
         - if:
+            # Instead of switching directions immediately,
+            # let the fan slow down first for 10 seconds
             condition:
               lambda: return id(my_fan).state;
             then:
@@ -225,17 +200,17 @@ fan:
                   id: my_gp8403_output_1
                   level: 0
               - delay: 10s
-              - script.execute: set_fan_speed
+              - if:
+                  condition:
+                    lambda: return id(my_fan).state;
+                  then:
+                    - script.execute: apply_fan_output
     on_oscillating_set:
       then:
-        - lambda: |-
-            // Within lambda, get the fan oscillating state and conditionally do something
-            if (id(my_fan).oscillating) {
-              // Fan is oscillating
-              if (id(my_fan).state) {
-                id(run_fan_oscillation).execute();
-              }
-            } else {
-              // Fan is not oscillating
-              id(run_fan_oscillation).stop();
-            }
+        - if:
+            condition:
+              lambda: return id(my_fan).oscillating && id(my_fan).state;
+            then:  # Start oscillating
+              - script.execute: run_fan_oscillation
+            else:  # Stop oscillating
+              - script.stop: run_fan_oscillation
